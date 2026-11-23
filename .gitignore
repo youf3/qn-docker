@@ -77,3 +77,6 @@ target/
 
 # Docker environment overrides
 .env
+
+# FABRIC deployment staging directories
+staging_*/

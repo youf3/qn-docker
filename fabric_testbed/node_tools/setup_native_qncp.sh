@@ -12,14 +12,15 @@ MQ_BRANCH="${3:-ethernet_probe_emulation}"
 PLUGINS_BRANCH="${4:-ethernet_probe_emulation}"
 ROLE_BRANCH="${5:-ethernet_probe_emulation}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QNCP_ROOT="/home/rocky/qncp"
 SRC_DIR="${QNCP_ROOT}/src"
 VENV_DIR="${QNCP_ROOT}/.venv"
 LOG_DIR="${QNCP_ROOT}/logs"
 
 # 0. Remove unreachable IPv4 nameservers and use dual-stack Rocky CDN on IPv6-only management VMs
+sudo sed -i '/192\.168\.122\.1/d; /0\.0\.0\.0/d' /etc/resolv.conf 2>/dev/null || true
 if ! ip -4 route show default 2>/dev/null | grep -q default; then
-    sudo sed -i '/192\.168\.122\.1/d; /0\.0\.0\.0/d' /etc/resolv.conf 2>/dev/null || true
     sudo sed -i 's/^mirrorlist=/#mirrorlist=/g; s|^#baseurl=http://dl.rockylinux.org|baseurl=https://dl.rockylinux.org|g' /etc/yum.repos.d/Rocky-*.repo 2>/dev/null || true
 fi
 
@@ -36,28 +37,8 @@ if ! command -v python3.11 &>/dev/null || ! command -v tmux &>/dev/null || ! com
 fi
 
 # 2b. Configure LinuxPTP (ptp_kvm + phc2sys) to synchronize CLOCK_REALTIME with KVM host PTP clock
-if command -v phc2sys &>/dev/null; then
-    sudo systemctl stop chronyd 2>/dev/null || true
-    sudo systemctl disable chronyd 2>/dev/null || true
-    echo ptp_kvm | sudo tee /etc/modules-load.d/ptp_kvm.conf >/dev/null
-    sudo modprobe ptp_kvm 2>/dev/null || true
-    sudo udevadm settle 2>/dev/null || true
-    sudo tee /lib/systemd/system/phc2sys@.service >/dev/null << 'EOF'
-[Unit]
-Description=Synchronize system clock or PTP hardware clock (PHC)
-Documentation=man:phc2sys
-
-[Service]
-Type=simple
-ExecStartPre=/bin/bash -c "/bin/systemctl set-environment PTP_KVM_DEV=$(readlink /dev/ptp_kvm)"
-ExecStart=/usr/sbin/phc2sys -u 8 -E linreg -O +0 -s /dev/${PTP_KVM_DEV} -c %i
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    sudo phc_ctl CLOCK_REALTIME set $(sudo phc_ctl /dev/ptp_kvm get | awk '{print $5}') >/dev/null 2>&1 || true
-    sudo systemctl daemon-reload
-    sudo systemctl enable --now phc2sys@CLOCK_REALTIME.service >/dev/null 2>&1 || true
+if command -v phc2sys &>/dev/null && [[ -f "${SCRIPT_DIR}/setup_ptp.sh" ]]; then
+    bash "${SCRIPT_DIR}/setup_ptp.sh" >/dev/null 2>&1 || true
 fi
 
 PY_BIN="python3.11"

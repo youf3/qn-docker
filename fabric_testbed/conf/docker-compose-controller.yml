@@ -1,0 +1,19 @@
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: mosquitto
+    restart: always
+    network_mode: host
+    ports:
+      - "1883:1883"
+      - "8080:8080"
+    volumes:
+      - ./conf/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+
+  mongo:
+    image: mongo:8.0
+    container_name: mongo
+    restart: always
+    network_mode: host
+    ports:
+      - "27017:27017"

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import json
 import os
 import random
@@ -36,6 +37,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from configobj import ConfigObj
 import networkx as _nx
 import yaml
 from networkx.readwrite import graphml as _graphml_module
@@ -104,6 +106,11 @@ def _resolve_workspace_dir(script_dir: Path) -> Path:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WORKSPACE_DIR = _resolve_workspace_dir(SCRIPT_DIR)
+QN_DOCKER_DIR = (
+    SCRIPT_DIR.parent if (SCRIPT_DIR.parent / "conf").is_dir() else WORKSPACE_DIR / "qn-docker"
+)
+BASE_CONF_DIR = QN_DOCKER_DIR / "conf"
+FABRIC_CONF_DIR = SCRIPT_DIR / "conf"
 NODE_TOOLS_DIR = SCRIPT_DIR / "node_tools"
 FABRIC_IMAGE = "docker_rocky_8"
 CONTROLLER_DISK_GB = 10
@@ -308,6 +315,25 @@ def build_mock_fabnetv6_ips(nodes: list[NodeSpec]) -> dict[str, str]:
     return ips
 
 
+def _load_merged_config(base_path: Path, override_path: Path) -> ConfigObj:
+    """Load base ConfigObj from qn-docker/conf and merge FABRIC overrides."""
+    if not base_path.is_file():
+        raise FileNotFoundError(f"Base config file not found: {base_path}")
+    if not override_path.is_file():
+        raise FileNotFoundError(f"FABRIC override config file not found: {override_path}")
+    cfg = ConfigObj(str(base_path), encoding="utf-8")
+    cfg.merge(ConfigObj(str(override_path), encoding="utf-8"))
+    return cfg
+
+
+def _write_config(cfg: ConfigObj, dest_path: Path) -> None:
+    """Serialize a ConfigObj instance to dest_path as UTF-8 text."""
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    buf = io.BytesIO()
+    cfg.write(buf)
+    dest_path.write_bytes(buf.getvalue())
+
+
 def configure_native_and_fabnetv6_bundles(
     staging_dir: Path,
     nodes: list[NodeSpec],
@@ -315,183 +341,47 @@ def configure_native_and_fabnetv6_bundles(
     fabnetv6_ips: dict[str, str],
     probe_base_port: int = DEFAULT_PROBE_BASE_PORT,
 ) -> None:
-    """Rewrite generated controller and agent bundles for native execution + FABNetv6 probes."""
+    """Build native controller and agent config bundles from external files in conf/."""
     (staging_dir / "fabnetv6_ips.json").write_text(json.dumps(fabnetv6_ips, indent=2) + "\n")
 
-    # 1. Controller docker-compose.yml (mosquitto + mongo only) and dual-stack mosquitto.conf
-    ctrl_compose = {
-        "services": {
-            "mosquitto": {
-                "image": "eclipse-mosquitto:2.0",
-                "container_name": "mosquitto",
-                "restart": "always",
-                "network_mode": "host",
-                "ports": ["1883:1883", "8080:8080"],
-                "volumes": ["./conf/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro"],
-            },
-            "mongo": {
-                "image": "mongo:8.0",
-                "container_name": "mongo",
-                "restart": "always",
-                "network_mode": "host",
-                "ports": ["27017:27017"],
-            },
-        }
-    }
-    (staging_dir / "controller" / "docker-compose.yml").write_text(
-        yaml.safe_dump(ctrl_compose, sort_keys=False)
+    # 1. Controller compose + mosquitto from declarative FABRIC artifacts
+    ctrl_compose_src = FABRIC_CONF_DIR / "docker-compose-controller.yml"
+    mosquitto_src = FABRIC_CONF_DIR / "mosquitto.fabric.conf"
+    if not ctrl_compose_src.is_file():
+        raise FileNotFoundError(f"Controller compose file not found: {ctrl_compose_src}")
+    if not mosquitto_src.is_file():
+        raise FileNotFoundError(f"Mosquitto config file not found: {mosquitto_src}")
+
+    shutil.copyfile(ctrl_compose_src, staging_dir / "controller" / "docker-compose.yml")
+    shutil.copyfile(mosquitto_src, staging_dir / "controller" / "conf" / "mosquitto.conf")
+
+    # 2. Controller quantnet.cfg: qn-docker/conf/quantnet.cfg + fabric_testbed/conf/quantnet.fabric.cfg
+    ctrl_cfg = _load_merged_config(
+        BASE_CONF_DIR / "quantnet.cfg",
+        FABRIC_CONF_DIR / "quantnet.fabric.cfg",
     )
-    (staging_dir / "controller" / "conf" / "mosquitto.conf").write_text(
-        textwrap.dedent("""\
-            listener 1883
-            allow_anonymous true
+    _write_config(ctrl_cfg, staging_dir / "controller" / "conf" / "quantnet.cfg")
 
-            listener 8080
-            protocol websockets
-            allow_anonymous true
-        """)
-    )
-
-    # 2. Controller quantnet.cfg for native execution
-    (staging_dir / "controller" / "conf" / "quantnet.cfg").write_text(
-        textwrap.dedent("""\
-            [common]
-            logdir = /home/rocky/qncp/logs
-            loglevel = INFO
-
-            [mq]
-            rpc_server_topic=rpc/qn-server
-            host=127.0.0.1
-            port=1883
-            ws_host=127.0.0.1
-            ws_port=8080
-            mongo_host=127.0.0.1
-            mongo_port=27017
-
-            [database]
-            default = mongodb://127.0.0.1:27017
-            schema = dev
-            echo=0
-            pool_recycle=3600
-            pool_size=20
-            max_overflow=20
-            pool_reset_on_return=rollback
-
-            [quantnet_api]
-            base_url = http://127.0.0.1:8000
-
-            [simulation]
-            database_file_path=/home/rocky/qncp/conf/quant-sim-db.json
-            mapping_file_path=/home/rocky/qncp/conf/mapping.yaml
-
-            [schedule_manager]
-            grace_period = 1000
-
-            [plugins]
-            path=/home/rocky/qncp/src/qn-plugins/plugins
-
-            [schemas]
-            path=/home/rocky/qncp/src/qn-plugins/plugins/schema
-
-            [scheduling]
-            name=BatchScheduler
-
-            [routing]
-            name=PathFinder
-
-            [monitoring]
-            name=Monitor
-        """)
-    )
-
-    # 3. Per-agent conf/agent.cfg with FABNetv6 IPv6 probe configuration
+    # 3. Per-agent conf/agent.cfg: qn-docker/conf/agent.cfg + fabric_testbed/conf/agent.fabric.cfg
     peer_ips_str = ",".join(
         f"{node.id}:{fabnetv6_ips[node.id]}" for node in nodes if node.id in fabnetv6_ips
     )
 
     for node in nodes:
-        agent_cfg_path = staging_dir / "agents" / node.id / "conf" / "agent.cfg"
+        agent_cfg = _load_merged_config(
+            BASE_CONF_DIR / "agent.cfg",
+            FABRIC_CONF_DIR / "agent.fabric.cfg",
+        )
         node_ipv6 = fabnetv6_ips.get(node.id, "::1")
+        agent_cfg["mq"]["host"] = controller_ip
+        for dev_name in ("lightsource", "signalmeasurement"):
+            agent_cfg["devices"][dev_name]["ip"] = node_ipv6
+            agent_cfg["devices"][dev_name]["base_port"] = str(probe_base_port)
+            agent_cfg["devices"][dev_name]["peer_ips"] = peer_ips_str
+        if node.type != NodeType.QNODE:
+            agent_cfg.pop("tasks", None)
 
-        tasks_block = ""
-        if node.type == NodeType.QNODE:
-            tasks_block = "\n[tasks]\n" + "\n".join(
-                f"[[downhill_calibration{i}]]\n"
-                f"path=/home/rocky/qncp/src/qn-agent/config/downhill_calibration{i}.json\n"
-                for i in range(1, 5)
-            )
-
-        agent_cfg_content = textwrap.dedent(f"""\
-            [common]
-            logdir = /home/rocky/qncp/logs
-            loglevel = INFO
-
-            [agent]
-            threads = 8
-
-            [mq]
-            host={controller_ip}
-            port=1883
-
-            [link]
-            hello_interval = 10
-            hold_time = 30
-
-            [interpreters]
-            path=/home/rocky/qncp/src/qn-plugins/plugins/pingpong/interpreter
-
-            [schemas]
-            path=/home/rocky/qncp/src/qn-plugins/plugins/schema
-
-            [protocols]
-            pingpong=pingpong.py
-
-            [devices]
-            [[exp_framework]]
-            enabled=true
-            type=Exp_Framework
-            driver=DummyExpFramework
-
-            [[lightsource]]
-            enabled=true
-            type=Light_Source
-            driver=DummyLightSrc
-            ip={node_ipv6}
-            base_port={probe_base_port}
-            peer_ips="{peer_ips_str}"
-
-            [[signalmeasurement]]
-            enabled=true
-            type=Signal_Measurement
-            driver=DummySignalMeasurement
-            ip={node_ipv6}
-            base_port={probe_base_port}
-            window=2.0
-            resolution=1e-7
-            peer_ips="{peer_ips_str}"
-
-            [[epc]]
-            enabled=true
-            type=Filter
-            driver=DummyEPC
-
-            [[polarimeter]]
-            enabled=true
-            type=Light_Measurement
-            driver=DummyPolarimeter
-
-            [[egp]]
-            enabled=true
-            type=EGP
-            driver=SimEGPDriver
-            protocol=EGProtocol
-
-            [[messaging]]
-            enabled=true
-            type=Messaging
-            driver=PassthroughDriver
-        """) + tasks_block
-        agent_cfg_path.write_text(agent_cfg_content)
+        _write_config(agent_cfg, staging_dir / "agents" / node.id / "conf" / "agent.cfg")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -512,7 +402,7 @@ def _add_qncp_vm(slice_, name: str, site: str, disk_gb: int):
     vm.add_fabnet(name="FABNET", net_type="IPv6", nic_type="NIC_Basic")
     vm.add_post_boot_upload_directory(str(NODE_TOOLS_DIR), ".")
     vm.add_post_boot_execute(
-        f"chmod +x node_tools/enable_docker.sh node_tools/setup_native_qncp.sh && "
+        f"chmod +x node_tools/*.sh && "
         f"./node_tools/enable_docker.sh {FABRIC_IMAGE}"
     )
     return vm
@@ -628,57 +518,23 @@ def get_fabnetv6_ips(slice_, nodes: list[NodeSpec]) -> dict[str, str]:
     return fabnetv6_ips
 
 
+def _sync_node_tools(vm) -> None:
+    """Ensure current node_tools scripts and systemd units are uploaded to ~/node_tools on a VM."""
+    if hasattr(vm, "upload_file"):
+        _upload_bundle_contents(vm, NODE_TOOLS_DIR, "/home/rocky/node_tools")
+        vm.execute("chmod +x /home/rocky/node_tools/*.sh", quiet=True)
+
+
 def setup_ptp_on_slice(slice_, nodes: list[NodeSpec]) -> None:
-    """Configure LinuxPTP (ptp_kvm + phc2sys) across all slice VMs (per fabric-testbed/ptp).
-
-    On FABRIC KVM hosts, `/dev/ptp_kvm` exposes the host's GPS/PTP-disciplined clock
-    directly inside the VM. Following https://github.com/fabric-testbed/ptp, this
-    disables chronyd, loads the `ptp_kvm` kernel module, installs `linuxptp`, steps
-    `CLOCK_REALTIME` to `/dev/ptp_kvm`, and runs `phc2sys@CLOCK_REALTIME.service` so
-    unidirectional quantum probe timestamps (`rx_ts - tx_ts`) have microsecond accuracy.
-    """
-    ptp_setup_script = textwrap.dedent("""\
-        set -e
-        if ! ip -4 route show default 2>/dev/null | grep -q default; then
-            sudo sed -i '/192\\.168\\.122\\.1/d; /0\\.0\\.0\\.0/d' /etc/resolv.conf 2>/dev/null || true
-            sudo sed -i 's/^mirrorlist=/#mirrorlist=/g; s|^#baseurl=http://dl.rockylinux.org|baseurl=https://dl.rockylinux.org|g' /etc/yum.repos.d/Rocky-*.repo 2>/dev/null || true
-        fi
-        if ! command -v phc2sys &>/dev/null; then
-            sudo dnf install -y --disablerepo=docker*,epel* --setopt=timeout=5 --setopt=retries=2 linuxptp >/dev/null
-        fi
-        sudo systemctl stop chronyd 2>/dev/null || true
-        sudo systemctl disable chronyd 2>/dev/null || true
-        echo ptp_kvm | sudo tee /etc/modules-load.d/ptp_kvm.conf >/dev/null
-        sudo modprobe ptp_kvm
-        sudo udevadm settle
-        sudo tee /lib/systemd/system/phc2sys@.service >/dev/null << 'EOF'
-        [Unit]
-        Description=Synchronize system clock or PTP hardware clock (PHC)
-        Documentation=man:phc2sys
-
-        [Service]
-        Type=simple
-        ExecStartPre=/bin/bash -c "/bin/systemctl set-environment PTP_KVM_DEV=$(readlink /dev/ptp_kvm)"
-        ExecStart=/usr/sbin/phc2sys -u 8 -E linreg -O +0 -s /dev/${PTP_KVM_DEV} -c %i
-
-        [Install]
-        WantedBy=multi-user.target
-        EOF
-        sudo phc_ctl CLOCK_REALTIME set $(sudo phc_ctl /dev/ptp_kvm get | awk '{print $5}') >/dev/null 2>&1 || true
-        sudo systemctl daemon-reload
-        sudo systemctl enable --now phc2sys@CLOCK_REALTIME.service >/dev/null 2>&1
-        sudo systemctl restart phc2sys@CLOCK_REALTIME.service
-        sleep 1
-        sudo phc_ctl /dev/ptp_kvm cmp | grep offset
-    """)
-
+    """Configure LinuxPTP (ptp_kvm + phc2sys) across all slice VMs via node_tools/setup_ptp.sh."""
     all_vms = [("controller", slice_.get_node("controller"))] + [
         (n.id, slice_.get_node(_vm_name(n.id))) for n in nodes
     ]
 
     def _configure_vm_ptp(item: tuple[str, object]) -> str:
         label, vm = item
-        out, err = vm.execute(ptp_setup_script, quiet=True)
+        _sync_node_tools(vm)
+        out, err = vm.execute("/home/rocky/node_tools/setup_ptp.sh", quiet=True)
         summary = " | ".join(line.strip() for line in out.splitlines() if line.strip())
         if not summary and err:
             summary = err.strip().splitlines()[-1]
@@ -787,6 +643,12 @@ def _ensure_native_qncp_on_vm(
         )
 
 
+def _start_controller_tmux_sessions(controller_vm) -> None:
+    """Upload latest node_tools and start/restart qncp-controller and qncp-api tmux sessions."""
+    _sync_node_tools(controller_vm)
+    controller_vm.execute("/home/rocky/node_tools/start_controller.sh", quiet=True)
+
+
 def deploy_controller(
     slice_,
     staging_dir: Path,
@@ -828,30 +690,8 @@ def deploy_controller(
         role_branch=server_branch,
     )
 
-    ctrl_cmd = (
-        "tmux kill-session -t qncp-controller 2>/dev/null || true; "
-        "tmux new-session -d -s qncp-controller "
-        "\"QUANTNET_LINK_ADJACENCY=true /home/rocky/qncp/.venv/bin/quantnet_controller "
-        "-c /home/rocky/qncp/conf/quantnet.cfg "
-        "--mq-broker-host 127.0.0.1 "
-        "--mq-mongo-host 127.0.0.1 "
-        "--plugin-path /home/rocky/qncp/src/qn-plugins/plugins "
-        "--schema-path /home/rocky/qncp/src/qn-plugins/plugins/schema "
-        "2>&1 | tee /home/rocky/qncp/logs/controller.console.log\""
-    )
-    controller_vm.execute(ctrl_cmd, quiet=True)
-    print("  Started native quantnet_controller in tmux session 'qncp-controller'")
-
-    api_cmd = (
-        "tmux kill-session -t qncp-api 2>/dev/null || true; "
-        "tmux new-session -d -s qncp-api "
-        "\"cd /home/rocky/qncp/src/qn-api && "
-        "QUANTNET_HOME=/home/rocky/qncp /home/rocky/qncp/.venv/bin/uvicorn main:app "
-        "--host :: --port 8081 "
-        "2>&1 | tee /home/rocky/qncp/logs/api.console.log\""
-    )
-    controller_vm.execute(api_cmd, quiet=True)
-    print("  Started native qn-api dashboard in tmux session 'qncp-api' (port 8081)")
+    _start_controller_tmux_sessions(controller_vm)
+    print("  Started native quantnet_controller ('qncp-controller') and qn-api ('qncp-api', port 8081)")
 
 
 def _build_agent_health_cmd(node_id: str | None = None, *, tmux_bin: str = "tmux") -> str:
@@ -1292,28 +1132,7 @@ def cmd_sync(args: argparse.Namespace) -> None:
             print(f"  [Synced] {vm_name:15s}: {label} (qncp-agent was {'UP' if is_up else 'DOWN'})")
 
     print("\n>>> Restarting qncp-controller and qncp-api on controller VM...")
-    ctrl_cmd = (
-        "tmux kill-session -t qncp-controller 2>/dev/null || true; "
-        "tmux new-session -d -s qncp-controller "
-        "\"QUANTNET_LINK_ADJACENCY=true /home/rocky/qncp/.venv/bin/quantnet_controller "
-        "-c /home/rocky/qncp/conf/quantnet.cfg "
-        "--mq-broker-host 127.0.0.1 "
-        "--mq-mongo-host 127.0.0.1 "
-        "--plugin-path /home/rocky/qncp/src/qn-plugins/plugins "
-        "--schema-path /home/rocky/qncp/src/qn-plugins/plugins/schema "
-        "2>&1 | tee /home/rocky/qncp/logs/controller.console.log\""
-    )
-    controller_vm.execute(ctrl_cmd, quiet=True)
-
-    api_cmd = (
-        "tmux kill-session -t qncp-api 2>/dev/null || true; "
-        "tmux new-session -d -s qncp-api "
-        "\"cd /home/rocky/qncp/src/qn-api && "
-        "QUANTNET_HOME=/home/rocky/qncp /home/rocky/qncp/.venv/bin/uvicorn main:app "
-        "--host :: --port 8081 "
-        "2>&1 | tee /home/rocky/qncp/logs/api.console.log\""
-    )
-    controller_vm.execute(api_cmd, quiet=True)
+    _start_controller_tmux_sessions(controller_vm)
     print("  Restarted qncp-controller and qncp-api on controller VM")
 
     time.sleep(5)
@@ -1373,9 +1192,10 @@ def cmd_test_config(args: argparse.Namespace) -> None:
         ctrl_compose = yaml.safe_load((staging_dir / "controller" / "docker-compose.yml").read_text())
         assert set(ctrl_compose["services"].keys()) == {"mosquitto", "mongo"}
 
-        ctrl_cfg = (staging_dir / "controller" / "conf" / "quantnet.cfg").read_text()
-        assert "host=127.0.0.1" in ctrl_cfg
-        assert "path=/home/rocky/qncp/src/qn-plugins/plugins" in ctrl_cfg
+        ctrl_cfg = ConfigObj(str(staging_dir / "controller" / "conf" / "quantnet.cfg"), encoding="utf-8")
+        assert ctrl_cfg["mq"]["host"] == "127.0.0.1"
+        assert ctrl_cfg["plugins"]["path"] == "/home/rocky/qncp/src/qn-plugins/plugins"
+        assert ctrl_cfg["scheduling"]["name"] == "BatchScheduler"
         print("  ✓ Controller bundle verified")
 
         for node in nodes:
@@ -1385,23 +1205,22 @@ def cmd_test_config(args: argparse.Namespace) -> None:
             assert agent_cfg_file.exists()
             assert node_def_file.exists()
 
-            agent_cfg = agent_cfg_file.read_text()
             node_v6 = fabnetv6_ips[node.id]
-            assert f"host={controller_ip}" in agent_cfg
-            assert "driver=DummyLightSrc" in agent_cfg
-            assert "driver=DummySignalMeasurement" in agent_cfg
-            assert f"ip={node_v6}" in agent_cfg
-            assert f"{node.id}:{node_v6}" in agent_cfg
+            cfg_obj = ConfigObj(str(agent_cfg_file), encoding="utf-8")
+            assert cfg_obj["mq"]["host"] == controller_ip
+            assert cfg_obj["agent"]["threads"] == "8"
+            assert cfg_obj["devices"]["lightsource"]["driver"] == "DummyLightSrc"
+            assert cfg_obj["devices"]["signalmeasurement"]["driver"] == "DummySignalMeasurement"
+            assert cfg_obj["devices"]["lightsource"]["ip"] == node_v6
+            assert f"{node.id}:{node_v6}" in cfg_obj["devices"]["lightsource"]["peer_ips"]
             if node.type == NodeType.QNODE:
-                assert "[tasks]" in agent_cfg
+                assert "tasks" in cfg_obj
             else:
-                assert "[tasks]" not in agent_cfg
+                assert "tasks" not in cfg_obj
 
             try:
-                from configobj import ConfigObj
                 from quantnet_agent.hal.driver.dummy import parse_virtual_links
 
-                cfg_obj = ConfigObj(str(agent_cfg_file))
                 ls_props = cfg_obj["devices"]["lightsource"]
                 cid, out_vlinks, in_vlinks = parse_virtual_links(
                     str(node_def_file),
