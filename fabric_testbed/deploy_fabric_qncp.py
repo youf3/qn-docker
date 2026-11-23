@@ -21,6 +21,7 @@ Prerequisites:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import random
@@ -167,6 +168,37 @@ def _resolve_reachable_bastion_host(host: str = "bastion.fabric-testbed.net", po
     return host
 
 
+DEFAULT_TOKEN_LIFETIME_HOURS = 4
+MAX_LONG_LIVED_TOKEN_HOURS = 1512  # 9 weeks (FABRIC Credential Manager maximum for is_token_holder)
+
+
+def _preferred_token_lifetime_hours(token_file: str, project_id: str | None) -> int:
+    """Return preferred FABRIC token lifetime in hours (1512 if long-lived token capability is present)."""
+    env_lifetime = os.environ.get("FABRIC_TOKEN_LIFETIME_HOURS")
+    if env_lifetime:
+        return int(env_lifetime)
+
+    token_path = Path(token_file).expanduser()
+    if not token_path.exists():
+        return MAX_LONG_LIVED_TOKEN_HOURS
+
+    try:
+        id_token = json.loads(token_path.read_text()).get("id_token") or ""
+        parts = id_token.split(".")
+        if len(parts) < 2:
+            return DEFAULT_TOKEN_LIFETIME_HOURS
+        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        for proj in claims.get("projects") or []:
+            if project_id and proj.get("uuid") != project_id:
+                continue
+            if (proj.get("memberships") or {}).get("is_token_holder") is True:
+                return MAX_LONG_LIVED_TOKEN_HOURS
+    except Exception:
+        pass
+    return DEFAULT_TOKEN_LIFETIME_HOURS
+
+
 def _init_fablib():
     """Initialize FablibManager using stored credentials, refreshing or re-authenticating if needed."""
     _load_fabric_rc_env()
@@ -178,7 +210,8 @@ def _init_fablib():
     try:
         fablib.get_user_info()
     except Exception as exc:
-        if "Token refresh failed" in str(exc) or "expired" in str(exc).lower():
+        err_lower = str(exc).lower()
+        if any(s in err_lower for s in ("token refresh failed", "expired", "401", "unauthorized", "no id_token")):
             print(
                 "Stored FABRIC token is expired and could not be refreshed automatically.\n"
                 "Starting browser authentication via FABRIC Credential Manager..."
@@ -186,13 +219,42 @@ def _init_fablib():
             from fabrictestbed.external_api.credmgr_client import CredmgrClient
 
             token_file = os.environ.get("FABRIC_TOKEN_LOCATION", str(Path.home() / ".tokens.json"))
-            cm = CredmgrClient("cm.fabric-testbed.net")
-            cm.create_cli(
-                project_id=os.environ.get("FABRIC_PROJECT_ID"),
-                file_path=token_file,
-                open_browser=True,
-                timeout=1800,
+            project_id = os.environ.get("FABRIC_PROJECT_ID")
+            lifetime_hours = _preferred_token_lifetime_hours(token_file, project_id)
+            comment = (
+                "Create Long-Lived Token via CLI"
+                if lifetime_hours > DEFAULT_TOKEN_LIFETIME_HOURS
+                else "Create Token via CLI"
             )
+            cm = CredmgrClient("cm.fabric-testbed.net")
+            try:
+                cm.create_cli(
+                    project_id=project_id,
+                    lifetime_hours=lifetime_hours,
+                    comment=comment,
+                    file_path=token_file,
+                    open_browser=True,
+                    timeout=1800,
+                )
+            except Exception as cm_exc:
+                cm_err = str(cm_exc).lower()
+                if lifetime_hours > DEFAULT_TOKEN_LIFETIME_HOURS and (
+                    "not authorized" in cm_err or "long lived tokens" in cm_err
+                ):
+                    cm.create_cli(
+                        project_id=project_id,
+                        lifetime_hours=DEFAULT_TOKEN_LIFETIME_HOURS,
+                        comment="Create Token via CLI",
+                        file_path=token_file,
+                        open_browser=True,
+                        timeout=1800,
+                    )
+                else:
+                    raise
+            try:
+                os.chmod(token_file, 0o600)
+            except OSError:
+                pass
             fablib = fablib_manager(bastion_host=bastion_host)
         else:
             raise
